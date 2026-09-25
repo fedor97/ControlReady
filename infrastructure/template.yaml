@@ -1,0 +1,265 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  CONTROLREADY — serverless backend (API Gateway + Lambda + DynamoDB + Cognito).
+  No EC2, no RDS, no Bedrock. Simulation logic stays client-side; this stack only
+  persists progress/reports and serves the lab catalog. See ARCHITECTURE.md.
+
+Parameters:
+  Stage:
+    Type: String
+    Default: prod
+  TablePrefix:
+    Type: String
+    Default: ControlReady
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 10
+    MemorySize: 128
+    Environment:
+      Variables:
+        DDB_TABLE_PREFIX: !Ref TablePrefix
+    CodeUri: ../backend/
+
+Resources:
+  # ───────────────────────── Auth ─────────────────────────
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${TablePrefix}-users"
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub "${TablePrefix}-web"
+      ExplicitAuthFlows: [ALLOW_USER_SRP_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      GenerateSecret: false
+
+  # ───────────────────────── API ─────────────────────────
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Stage
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowHeaders: ["Content-Type", "Authorization"]
+        AllowMethods: ["GET", "POST", "OPTIONS"]
+      Auth:
+        Authorizers:
+          CognitoAuthorizer:
+            JwtConfiguration:
+              issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+              audience: [!Ref UserPoolClient]
+            IdentitySource: "$request.header.Authorization"
+        DefaultAuthorizer: CognitoAuthorizer
+
+  ProgressFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: lambdas/progress.handler
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref StudentProgressTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref TroubleshootingSessionsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref ScoresTable }
+      Events:
+        Get:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /progress, Method: GET }
+        Post:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /progress, Method: POST }
+
+  ReportsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: lambdas/reports.handler
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref ServiceReportsTable }
+      Events:
+        Post:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /reports, Method: POST }
+
+  LabsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: lambdas/labs.handler
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref LabsTable }
+      Events:
+        Get:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /labs
+            Method: GET
+            Auth: { Authorizer: NONE } # lab catalog is public/unauthenticated
+
+  # ───────────────────────── Data ─────────────────────────
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-Users"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: userId, AttributeType: S }]
+      KeySchema: [{ AttributeName: userId, KeyType: HASH }]
+
+  LabsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-Labs"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: labId, AttributeType: S }]
+      KeySchema: [{ AttributeName: labId, KeyType: HASH }]
+
+  WorkOrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-WorkOrders"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: workOrderId, AttributeType: S }]
+      KeySchema: [{ AttributeName: workOrderId, KeyType: HASH }]
+
+  FaultScenariosTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-FaultScenarios"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: labId, AttributeType: S }
+        - { AttributeName: faultId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: labId, KeyType: HASH }
+        - { AttributeName: faultId, KeyType: RANGE }
+
+  StudentProgressTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-StudentProgress"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: userId, AttributeType: S }
+        - { AttributeName: labId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: userId, KeyType: HASH }
+        - { AttributeName: labId, KeyType: RANGE }
+
+  TroubleshootingSessionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-TroubleshootingSessions"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: userId, AttributeType: S }
+        - { AttributeName: sessionId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: userId, KeyType: HASH }
+        - { AttributeName: sessionId, KeyType: RANGE }
+
+  ScoresTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-Scores"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: userId, AttributeType: S }
+        - { AttributeName: sessionId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: userId, KeyType: HASH }
+        - { AttributeName: sessionId, KeyType: RANGE }
+
+  ServiceReportsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-ServiceReports"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: userId, AttributeType: S }
+        - { AttributeName: sessionId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: userId, KeyType: HASH }
+        - { AttributeName: sessionId, KeyType: RANGE }
+
+  # Reserved for the future optional premium AI Tutor — see ARCHITECTURE.md §6. Empty/unused costs ~$0 on-demand.
+  AIInteractionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TablePrefix}-AIInteractions"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: userId, AttributeType: S }
+        - { AttributeName: interactionId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: userId, KeyType: HASH }
+        - { AttributeName: interactionId, KeyType: RANGE }
+
+  # ───────────────────────── Frontend hosting ─────────────────────────
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "controlready-frontend-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  FrontendOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${TablePrefix}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        # SPA fallback: unknown paths (client-side routes) resolve to index.html
+        CustomErrorResponses:
+          - { ErrorCode: 403, ResponseCode: 200, ResponsePagePath: /index.html }
+          - { ErrorCode: 404, ResponseCode: 200, ResponsePagePath: /index.html }
+        Origins:
+          - Id: s3origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt FrontendOAC.Id
+            S3OriginConfig: {}
+        DefaultCacheBehavior:
+          TargetOriginId: s3origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # AWS managed "CachingOptimized"
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}"
+
+Outputs:
+  ApiUrl:
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}"
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+  CloudFrontDomain:
+    Value: !GetAtt FrontendDistribution.DomainName
